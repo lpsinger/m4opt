@@ -68,13 +68,16 @@ def schedule(
             help="Time step for evaluating field of regard",
         ),
     ] = "1 min",
-    exptime: Annotated[
+    min_exptime: Annotated[
         u.Quantity[u.physical.time],
         typer.Option(
             parser=u.Quantity,
-            help="Exposure time for each observation",
+            help="Minimum exposure time for each observation",
         ),
     ] = "900 s",
+    absmag: Annotated[
+        float, typer.Option(help="AB absolute magnitude of source")
+    ] = -14,
     visits: Annotated[int, typer.Option(min=1, help="Number of visits")] = 2,
     cadence: Annotated[
         u.Quantity[u.physical.time],
@@ -115,7 +118,7 @@ def schedule(
         target_coords = mission.skygrid
         # FIXME: https://github.com/astropy/astropy/issues/17030
         target_coords = SkyCoord(target_coords.ra, target_coords.dec)
-        exptime_s = exptime.to_value(u.s)
+        min_exptime_s = min_exptime.to_value(u.s)
         cadence_s = cadence.to_value(u.s)
         obstimes_s = (obstimes - obstimes[0]).to_value(u.s)
         observable_intervals = np.asarray(
@@ -138,14 +141,10 @@ def schedule(
             dtype=object,
         )
 
-        # Subtract off exposure times from end times.
-        for intervals in observable_intervals:
-            intervals[:, 1] -= exptime_s
-
         # Keep only intervals that are at least as long as the exposure time.
         observable_intervals = np.asarray(
             [
-                intervals[intervals[:, 1] - intervals[:, 0] >= 0]
+                intervals[intervals[:, 1] - intervals[:, 0] >= min_exptime_s]
                 for intervals in observable_intervals
             ],
             dtype=object,
@@ -198,19 +197,22 @@ def schedule(
 
     with status("calculating slew times"):
         slew_i, slew_j = np.triu_indices(n_fields, 1)
-        timediff_s = (
-            exptime
-            + mission.slew.time(
-                target_coords[slew_i],
-                target_coords[slew_j],
-                rolls[slew_i],
-                rolls[slew_j],
-            )
+        timediff_s = mission.slew.time(
+            target_coords[slew_i],
+            target_coords[slew_j],
+            rolls[slew_i],
+            rolls[slew_j],
         ).to_value(u.s)
 
     with status("assembling MILP model"):
         model = Model(timelimit=timelimit, jobs=jobs)
         pixel_vars = model.binary_vars(n_pixels)
+        if min_exptime_s > 0:
+            exptime_field_visit_vars = model.semicontinuous_vars(
+                (n_fields, visits), lb=min_exptime_s
+            )
+        else:
+            exptime_field_visit_vars = model.continuous_vars((n_fields, visits), lb=0)
         field_vars = model.binary_vars(n_fields)
         start_time_field_visit_vars = model.continuous_vars(
             (n_fields, visits),
@@ -220,10 +222,19 @@ def schedule(
 
         # Add constraints on observability windows for each field
         with status("adding field of regard constraints"):
-            for start_time_visit_vars, intervals in zip(
-                start_time_field_visit_vars, observable_intervals
+            for start_time_visit_vars, exptime_visit_vars, intervals in zip(
+                start_time_field_visit_vars,
+                exptime_field_visit_vars,
+                observable_intervals,
             ):
-                if len(intervals) > 1:
+                assert len(intervals) > 0
+                if len(intervals) == 1:
+                    ((begin, end),) = intervals
+                    model.add_constraint_(start_time_visit_vars >= begin)
+                    model.add_constraint_(
+                        start_time_visit_vars + exptime_visit_vars <= end
+                    )
+                else:
                     begin, end = intervals.T
                     visit_interval_vars = model.binary_vars((visits, len(intervals)))
                     for interval_vars in visit_interval_vars:
@@ -233,7 +244,9 @@ def schedule(
                         start_time_visit_vars[:, np.newaxis] >= begin,
                     )
                     model.add_indicators(
-                        visit_interval_vars, start_time_visit_vars[:, np.newaxis] <= end
+                        visit_interval_vars,
+                        (start_time_visit_vars + exptime_visit_vars)[:, np.newaxis]
+                        <= end,
                     )
 
         if visits > 1:
@@ -253,7 +266,8 @@ def schedule(
                     start_time_field_visit_vars[slew_i, p[:, np.newaxis]]
                     - start_time_field_visit_vars[slew_j, q[:, np.newaxis]]
                 )
-                >= timediff_s * (field_vars[slew_i] + field_vars[slew_j] - 1)
+                >= exptime_field_visit_varstimediff_s
+                * (field_vars[slew_i] + field_vars[slew_j] - 1)
             )
 
         with status("adding coverage constraints"):
