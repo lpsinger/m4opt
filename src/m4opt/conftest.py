@@ -13,13 +13,14 @@ import numpy as np
 import pytest
 from pytest_astropy_header.display import PYTEST_HEADER_MODULES, TESTED_VERSIONS
 
-from .tests.plugins.generated_file import generated_file  # noqa: F401
-from .tests.plugins.problem_size_limits import (  # noqa: F401
-    pytest_runtest_call,
-    pytest_runtest_setup,
-)
+from .tests.plugins import generated_file, problem_size_limits
 
-pytest_plugins = ["sphinx.testing.fixtures", "pytester"]
+pytest_plugins = [
+    "sphinx.testing.fixtures",
+    "pytester",
+    problem_size_limits.__name__,
+    generated_file.__name__,
+]
 
 
 def pytest_configure(config: pytest.Config):
